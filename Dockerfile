@@ -25,6 +25,7 @@ RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash || echo "
 
 USER root
 COPY start.sh /start.sh
-RUN chmod +x /start.sh
+COPY hermes-sync /usr/local/bin/hermes-sync
+RUN chmod +x /start.sh /usr/local/bin/hermes-sync
 
 CMD ["/start.sh"]
