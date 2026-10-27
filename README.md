@@ -23,8 +23,8 @@ apoap restore hoto.
 
 ## Terminal commands
 ```
-sudo hermes-sync backup      # lagech backup
-sudo hermes-sync status      # backups chi list
-sudo hermes-sync restore     # latest restore
+hermes-sync backup      # lagech backup
+hermes-sync status      # backups chi list
+hermes-sync restore     # latest restore
 ```
-Mahatvache: `hermes setup` zalyavar `sudo hermes-sync backup` ek vela chalva, mhanje setup lagech surakshit.
+Mahatvache: `hermes setup` zalyavar `hermes-sync backup` ek vela chalva, mhanje setup lagech surakshit.

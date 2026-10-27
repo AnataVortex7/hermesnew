@@ -23,18 +23,19 @@ fi
 BACKUP_ON=0
 if [ -n "${BACKUP_URL:-}" ] && [ -n "${BACKUP_TOKEN:-}" ]; then
   BACKUP_ON=1
-  # `sudo hermes-sync ...` from the terminal needs the settings too (root-only file)
+  # settings file read by `hermes-sync` (Render blocks sudo, so it must be readable by the hermes user)
   umask 077
   {
     echo "export BACKUP_URL='${BACKUP_URL}'"
     echo "export BACKUP_TOKEN='${BACKUP_TOKEN}'"
     echo "export BACKUP_NAME='${BACKUP_NAME:-hermes}'"
     echo "export BACKUP_EXCLUDE='${BACKUP_EXCLUDE:-}'"
-  } > /etc/hermes-backup.env
+  } > /home/hermes/.hermes-sync.env
+  chown hermes:hermes /home/hermes/.hermes-sync.env
   umask 022
   rm -f /tmp/.hermes_restore_done
   echo "Restoring Hermes data from tgstorage..."
-  hermes-sync restore || echo "restore not finished yet, will keep retrying in background"
+  su hermes -s /bin/bash -c '/usr/local/bin/hermes-sync restore' || echo "restore not finished yet, will keep retrying in background"
 else
   echo "BACKUP_URL / BACKUP_TOKEN not set - data will be LOST on restart"
 fi
@@ -60,9 +61,9 @@ if [ "$BACKUP_ON" = 1 ]; then
     while true; do
       sleep "${BACKUP_INTERVAL:-600}"
       if [ ! -f /tmp/.hermes_restore_done ]; then
-        RESTORE_TRIES=1 hermes-sync restore --late
+        su hermes -s /bin/bash -c 'RESTORE_TRIES=1 /usr/local/bin/hermes-sync restore --late'
       fi
-      [ -f /tmp/.hermes_restore_done ] && hermes-sync backup --if-changed
+      [ -f /tmp/.hermes_restore_done ] && su hermes -s /bin/bash -c '/usr/local/bin/hermes-sync backup --if-changed'
     done
   ) &
 fi
@@ -86,7 +87,7 @@ TTYD=$!
 # Render sends SIGTERM on restart/redeploy (~30 s grace): take a last backup first
 final_backup() {
   if [ "$BACKUP_ON" = 1 ] && [ -f /tmp/.hermes_restore_done ]; then
-    timeout 25 hermes-sync backup --if-changed
+    timeout 25 su hermes -s /bin/bash -c '/usr/local/bin/hermes-sync backup --if-changed'
   fi
   pkill -f 'hermes gateway' 2>/dev/null
   pkill ttyd 2>/dev/null

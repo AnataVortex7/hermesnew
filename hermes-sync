@@ -1,10 +1,19 @@
 #!/bin/bash
-# hermes-sync backup | restore [--late] | status
+# hermes-sync backup | restore [--late] | status   (run as the hermes user, no sudo needed)
 # Backs up /home/hermes/.hermes to tgstorage (Telegram) and restores it after a Render restart.
-[ -f /etc/hermes-backup.env ] && . /etc/hermes-backup.env
+[ -f /home/hermes/.hermes-sync.env ] && . /home/hermes/.hermes-sync.env
 : "${BACKUP_URL:?BACKUP_URL not set}" "${BACKUP_TOKEN:?BACKUP_TOKEN not set}"
 
 HOME_DIR=/home/hermes
+LOG="$HOME_DIR/sync.log"          # permanent log: `hermes-sync status` or `cat ~/sync.log`
+log() {
+  echo "$*"
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LOG" 2>/dev/null
+  if [ "$(stat -c %s "$LOG" 2>/dev/null || echo 0)" -gt 200000 ]; then
+    tail -n 300 "$LOG" > "$LOG.tmp" && mv -f "$LOG.tmp" "$LOG"
+  fi
+  chown hermes:hermes "$LOG" 2>/dev/null
+}
 NAME="${BACKUP_NAME:-hermes}"
 URL="${BACKUP_URL%/}/hapi/backup/$NAME"
 AUTH="Authorization: Bearer ${BACKUP_TOKEN}"
@@ -27,17 +36,17 @@ changed() {  # any file (outside the excluded dirs) newer than the last backup?
 case "${1:-}" in
 backup)
   [ "${2:-}" = "--if-changed" ] && ! changed && exit 0
-  [ -d "$HOME_DIR/.hermes" ] || { echo "[sync] no ~/.hermes yet, nothing to back up"; exit 0; }
+  [ -d "$HOME_DIR/.hermes" ] || { log "[sync] no ~/.hermes yet, nothing to back up"; exit 0; }
   tmp=$(mktemp /tmp/hb.XXXXXX); trap 'rm -f "$tmp"' EXIT
   touch "$MARK.new"
   tar czf "$tmp" -C "$HOME_DIR" "${EXCL[@]}" .hermes 2>/dev/null
   size=$(stat -c %s "$tmp")
-  [ "$size" -gt "$MAX_BYTES" ] && { echo "[sync] backup is $size bytes > limit, skipped (use BACKUP_EXCLUDE)"; exit 1; }
+  [ "$size" -gt "$MAX_BYTES" ] && { log "[sync] backup is $size bytes > limit, skipped (use BACKUP_EXCLUDE)"; exit 1; }
   if curl -fsS --retry 4 --retry-delay 10 --retry-all-errors --max-time 900 -X POST \
        -H "$AUTH" -H "Content-Type: application/gzip" -T "$tmp" "$URL" >/tmp/.hermes_sync_resp; then
-    mv -f "$MARK.new" "$MARK"; echo "[sync] backup ok ($size bytes)"
+    mv -f "$MARK.new" "$MARK"; log "[sync] backup ok ($size bytes)"
   else
-    echo "[sync] backup FAILED: $(cat /tmp/.hermes_sync_resp 2>/dev/null)"; exit 1
+    log "[sync] backup FAILED: $(cat /tmp/.hermes_sync_resp 2>/dev/null)"; exit 1
   fi ;;
 
 restore)
@@ -49,18 +58,22 @@ restore)
       200)
         # safety: only ever extract paths under .hermes/
         if ! tar tzf "$tmp" >/dev/null 2>&1 || tar tzf "$tmp" | grep -qvE '^\.hermes(/|$)'; then
-          echo "[sync] backup file looks wrong, NOT restored"; exit 1; fi
+          log "[sync] backup file looks wrong, NOT restored"; exit 1; fi
         opts=(--no-same-owner); [ "$late" = 1 ] && opts+=(--skip-old-files)   # late restore never overwrites newer local files
         tar xzf "$tmp" -C "$HOME_DIR" "${opts[@]}" && chown -R hermes:hermes "$HOME_DIR/.hermes"
-        touch "$MARK" "$DONE"; echo "[sync] restored from backup"; exit 0 ;;
-      404) touch "$MARK" "$DONE"; echo "[sync] no backup yet (first run)"; exit 0 ;;
-      401) echo "[sync] wrong BACKUP_TOKEN"; exit 2 ;;
-      *)   echo "[sync] storage not ready (http $code), retry $i/$tries"; sleep 15 ;;
+        touch "$MARK" "$DONE"; log "[sync] restored from backup"; exit 0 ;;
+      404) touch "$MARK" "$DONE"; log "[sync] no backup yet (first run)"; exit 0 ;;
+      401) log "[sync] wrong BACKUP_TOKEN"; exit 2 ;;
+      *)   log "[sync] storage not ready (http $code), retry $i/$tries"; sleep 15 ;;
     esac
   done
-  echo "[sync] could not restore yet — backups stay paused until it works"; exit 1 ;;
+  log "[sync] could not restore yet — backups stay paused until it works"; exit 1 ;;
 
 status)
-  curl -sS --max-time 60 -H "$AUTH" "${BACKUP_URL%/}/hapi/backups"; echo ;;
+  echo "== last sync events (~/sync.log) =="; tail -n 12 "$LOG" 2>/dev/null || echo "(none yet)"
+  echo; echo "== backups stored in tgstorage (newest first) =="
+  curl -sS --max-time 60 -H "$AUTH" "${BACKUP_URL%/}/hapi/backups" | sed 's/},{/},\n{/g'; echo
+  echo; echo "restore done this boot: $([ -f "$DONE" ] && echo yes || echo NO)"
+  echo "last successful backup: $([ -f "$MARK" ] && date -r "$MARK" -u +%FT%TZ || echo never)" ;;
 *) echo "usage: hermes-sync backup [--if-changed] | restore [--late] | status"; exit 64 ;;
 esac
