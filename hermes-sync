@@ -80,7 +80,7 @@ restore)
   late=0; [ "${2:-}" = "--late" ] && late=1
   tries="${RESTORE_TRIES:-8}"; tmp=$(mktemp /tmp/hr.XXXXXX); trap 'rm -f "$tmp"' EXIT
   for i in $(seq 1 "$tries"); do
-    code=$(curl -sS -o "$tmp" -w '%{http_code}' --max-time 300 -H "$AUTH" "$URL" 2>/dev/null)
+    code=$(curl -sS -o "$tmp" -w '%{http_code}' --connect-timeout 20 --max-time 300 -H "$AUTH" "$URL" 2>/dev/null)
     case "$code" in
       200)
         # safety: only ever extract paths under .hermes/
