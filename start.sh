@@ -3,6 +3,7 @@ set -u
 
 PORT="${PORT:-10000}"
 TS_HOSTNAME="${TS_HOSTNAME:-render-hermes}"
+HERMES_VERSION="${HERMES_VERSION:-v2026.3.23}"   # pinned release tag (Hermes v0.4.0)
 
 # 1) Tailscale in userspace mode (Render has no /dev/net/tun)
 mkdir -p /var/lib/tailscale /var/run/tailscale
@@ -29,6 +30,8 @@ if [ -n "${BACKUP_URL:-}" ] && [ -n "${BACKUP_TOKEN:-}" ]; then
     echo "export BACKUP_URL='${BACKUP_URL}'"
     echo "export BACKUP_TOKEN='${BACKUP_TOKEN}'"
     echo "export BACKUP_NAME='${BACKUP_NAME:-hermes}'"
+    echo "export BACKUP_INTERVAL='${BACKUP_INTERVAL:-10800}'"
+    echo "export BACKUP_MAX_MB='${BACKUP_MAX_MB:-200}'"
     echo "export BACKUP_EXCLUDE='${BACKUP_EXCLUDE:-}'"
   } > /home/hermes/.hermes-sync.env
   chown hermes:hermes /home/hermes/.hermes-sync.env
@@ -43,9 +46,10 @@ fi
 # 3) Make sure Hermes is installed (retry if build-time install failed)
 if ! su - hermes -c 'command -v hermes >/dev/null 2>&1'; then
   echo "Hermes not found, installing..."
-  su - hermes -c 'curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash' \
+  su - hermes -c "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_VERSION}/scripts/install.sh | bash -s -- --branch ${HERMES_VERSION} --skip-setup" \
     || echo "Hermes install failed - run it manually in the terminal"
 fi
+echo "Hermes version: $(su - hermes -c 'hermes --version' 2>&1 | head -n 1)  (pinned tag: ${HERMES_VERSION})"
 
 # 3b) Hermes messaging gateway (Telegram bot) - restarts itself if it crashes
 su - hermes -c 'while true; do
@@ -55,11 +59,13 @@ su - hermes -c 'while true; do
   sleep 30
 done' >/dev/null 2>&1 &
 
-# 4) Periodic backup (only when something changed, and only after a successful restore check)
+# 4) Periodic backup. Wakes every 10 min (cheap, no network) but `--if-changed` only uploads when
+#    (a) real data changed AND (b) BACKUP_INTERVAL seconds (default 3 h) passed since the last upload.
+#    Uploads count as Render OUTBOUND bandwidth, so we keep them rare.
 if [ "$BACKUP_ON" = 1 ]; then
   (
     while true; do
-      sleep "${BACKUP_INTERVAL:-600}"
+      sleep 600
       if [ ! -f /tmp/.hermes_restore_done ]; then
         su hermes -s /bin/bash -c 'RESTORE_TRIES=1 /usr/local/bin/hermes-sync restore --late'
       fi
@@ -87,7 +93,7 @@ TTYD=$!
 # Render sends SIGTERM on restart/redeploy (~30 s grace): take a last backup first
 final_backup() {
   if [ "$BACKUP_ON" = 1 ] && [ -f /tmp/.hermes_restore_done ]; then
-    timeout 25 su hermes -s /bin/bash -c '/usr/local/bin/hermes-sync backup --if-changed'
+    timeout 25 su hermes -s /bin/bash -c '/usr/local/bin/hermes-sync backup --final'
   fi
   pkill -f 'hermes gateway' 2>/dev/null
   pkill ttyd 2>/dev/null

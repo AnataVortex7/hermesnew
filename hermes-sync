@@ -1,6 +1,12 @@
 #!/bin/bash
-# hermes-sync backup | restore [--late] | status   (run as the hermes user, no sudo needed)
+# hermes-sync backup [--if-changed|--final] | restore [--late] | status   (run as the hermes user, no sudo needed)
 # Backs up /home/hermes/.hermes to tgstorage (Telegram) and restores it after a Render restart.
+#
+# NOTE: every backup UPLOAD counts as Render outbound bandwidth (restore/download is inbound = free).
+# So uploads are kept rare:
+#   --if-changed : upload only if (a) real data changed AND (b) BACKUP_INTERVAL s (default 3 h) passed since last upload
+#   --final      : used on SIGTERM (restart/redeploy): upload if data changed, ignore the time gap
+#   (no flag)    : manual, always uploads
 [ -f /home/hermes/.hermes-sync.env ] && . /home/hermes/.hermes-sync.env
 : "${BACKUP_URL:?BACKUP_URL not set}" "${BACKUP_TOKEN:?BACKUP_TOKEN not set}"
 
@@ -17,34 +23,55 @@ log() {
 NAME="${BACKUP_NAME:-hermes}"
 URL="${BACKUP_URL%/}/hapi/backup/$NAME"
 AUTH="Authorization: Bearer ${BACKUP_TOKEN}"
-MARK=/tmp/.hermes_last_backup
+MARK=/tmp/.hermes_last_backup          # mtime = time of last upload/restore (used for the time gap)
+FP=/tmp/.hermes_fp                     # fingerprint of data at last upload/restore
+UPLOADED=/tmp/.hermes_uploaded_bytes   # bytes uploaded since this container started
 DONE=/tmp/.hermes_restore_done
 MAX_BYTES=$(( ${BACKUP_MAX_MB:-200} * 1024 * 1024 ))
-# big, re-installable stuff is NOT backed up (only config, keys, memory, sessions, ...)
-EXCL=(--exclude=.hermes/hermes-agent --exclude=.hermes/tools
-      --exclude='*/node_modules' --exclude='*/__pycache__' --exclude='*/.cache' --exclude='*.pyc')
+MIN_GAP="${BACKUP_INTERVAL:-10800}"
+
+# NOT backed up: re-installable code + noisy logs/caches (they change all the time and would force re-uploads)
+SKIP=(.hermes/hermes-agent .hermes/tools .hermes/logs .hermes/checkpoints
+      '*/node_modules' '*/__pycache__' '*/.cache' '*_cache' '*.pyc' '*.log' '*.lock' '*.pid' '*.tmp')
+EXCL=(); for p in "${SKIP[@]}"; do EXCL+=("--exclude=$p"); done
 for x in ${BACKUP_EXCLUDE:-}; do EXCL+=("--exclude=$x"); done
 
-changed() {  # any file (outside the excluded dirs) newer than the last backup?
+# fingerprint = hash of (path,size,mtime) of every backed-up file; same fingerprint => nothing to upload
+fingerprint() {
+  local prune=( -path .hermes/hermes-agent -o -path .hermes/tools -o -path .hermes/logs -o -path .hermes/checkpoints
+                -o -name node_modules -o -name __pycache__ -o -name .cache -o -name '*_cache' )
+  for x in ${BACKUP_EXCLUDE:-}; do prune+=( -o -path "$x" ); done
+  ( cd "$HOME_DIR" && find .hermes \( "${prune[@]}" \) -prune -o -type f \
+      ! -name '*.log' ! -name '*.lock' ! -name '*.pid' ! -name '*.tmp' ! -name '*.pyc' \
+      -printf '%p %s %T@\n' 2>/dev/null | sort | sha256sum | cut -d' ' -f1 )
+}
+changed() {
   [ -d "$HOME_DIR/.hermes" ] || return 1
+  [ -f "$FP" ] || return 0
+  [ "$(fingerprint)" != "$(cat "$FP")" ]
+}
+due() {
   [ -f "$MARK" ] || return 0
-  find "$HOME_DIR/.hermes" \( -path "$HOME_DIR/.hermes/hermes-agent" -o -path "$HOME_DIR/.hermes/tools" \
-       -o -name node_modules -o -name __pycache__ -o -name .cache \) -prune \
-       -o -type f -newer "$MARK" -print -quit | grep -q .
+  [ $(( $(date +%s) - $(stat -c %Y "$MARK") )) -ge "$MIN_GAP" ]
 }
 
 case "${1:-}" in
 backup)
-  [ "${2:-}" = "--if-changed" ] && ! changed && exit 0
+  case "${2:-}" in
+    --if-changed) due || exit 0; changed || exit 0 ;;
+    --final)      changed || exit 0 ;;
+  esac
   [ -d "$HOME_DIR/.hermes" ] || { log "[sync] no ~/.hermes yet, nothing to back up"; exit 0; }
   tmp=$(mktemp /tmp/hb.XXXXXX); trap 'rm -f "$tmp"' EXIT
-  touch "$MARK.new"
+  fp_now=$(fingerprint)
   tar czf "$tmp" -C "$HOME_DIR" "${EXCL[@]}" .hermes 2>/dev/null
   size=$(stat -c %s "$tmp")
   [ "$size" -gt "$MAX_BYTES" ] && { log "[sync] backup is $size bytes > limit, skipped (use BACKUP_EXCLUDE)"; exit 1; }
-  if curl -fsS --retry 4 --retry-delay 10 --retry-all-errors --max-time 900 -X POST \
+  # --retry 2 (not 4): every retry re-uploads the whole file = more outbound bandwidth
+  if curl -fsS --retry 2 --retry-delay 10 --retry-all-errors --max-time 900 -X POST \
        -H "$AUTH" -H "Content-Type: application/gzip" -T "$tmp" "$URL" >/tmp/.hermes_sync_resp; then
-    mv -f "$MARK.new" "$MARK"; log "[sync] backup ok ($size bytes)"
+    touch "$MARK"; echo "$fp_now" > "$FP"; echo "$size" >> "$UPLOADED"
+    log "[sync] backup ok ($size bytes)"
   else
     log "[sync] backup FAILED: $(cat /tmp/.hermes_sync_resp 2>/dev/null)"; exit 1
   fi ;;
@@ -61,7 +88,7 @@ restore)
           log "[sync] backup file looks wrong, NOT restored"; exit 1; fi
         opts=(--no-same-owner); [ "$late" = 1 ] && opts+=(--skip-old-files)   # late restore never overwrites newer local files
         tar xzf "$tmp" -C "$HOME_DIR" "${opts[@]}" && chown -R hermes:hermes "$HOME_DIR/.hermes"
-        touch "$MARK" "$DONE"; log "[sync] restored from backup"; exit 0 ;;
+        touch "$MARK" "$DONE"; fingerprint > "$FP"; log "[sync] restored from backup"; exit 0 ;;
       404) touch "$MARK" "$DONE"; log "[sync] no backup yet (first run)"; exit 0 ;;
       401) log "[sync] wrong BACKUP_TOKEN"; exit 2 ;;
       *)   log "[sync] storage not ready (http $code), retry $i/$tries"; sleep 15 ;;
@@ -70,10 +97,14 @@ restore)
   log "[sync] could not restore yet — backups stay paused until it works"; exit 1 ;;
 
 status)
-  echo "== last sync events (~/sync.log) =="; tail -n 12 "$LOG" 2>/dev/null || echo "(none yet)"
+  echo "== last sync events (~/sync.log) ==";
+  tail -n 12 "$LOG" 2>/dev/null || echo "(none yet)"
   echo; echo "== backups stored in tgstorage (newest first) =="
   curl -sS --max-time 60 -H "$AUTH" "${BACKUP_URL%/}/hapi/backups" | sed 's/},{/},\n{/g'; echo
   echo; echo "restore done this boot: $([ -f "$DONE" ] && echo yes || echo NO)"
-  echo "last successful backup: $([ -f "$MARK" ] && date -r "$MARK" -u +%FT%TZ || echo never)" ;;
-*) echo "usage: hermes-sync backup [--if-changed] | restore [--late] | status"; exit 64 ;;
+  echo "last successful backup: $([ -f "$MARK" ] && date -r "$MARK" -u +%FT%TZ || echo never)"
+  echo "data changed since then: $(changed && echo yes || echo no)"
+  echo "uploaded since container start: $(awk '{s+=$1} END {printf "%.2f MB in %d upload(s)", s/1048576, NR}' "$UPLOADED" 2>/dev/null || echo 0)"
+  echo "size of ~/.hermes (before exclusions): $(du -sh "$HOME_DIR/.hermes" 2>/dev/null | cut -f1)" ;;
+*) echo "usage: hermes-sync backup [--if-changed|--final] | restore [--late] | status"; exit 64 ;;
 esac

@@ -18,10 +18,16 @@ RUN curl -fsSL -o /usr/local/bin/ttyd \
 RUN useradd -m -s /bin/bash hermes \
     && echo "hermes ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/hermes
 
-# Install Hermes Agent as that user
+# Hermes version is PINNED (v0.4.0). Change here (and nowhere else) to move to another release tag.
+ARG HERMES_VERSION=v2026.3.23
+ENV HERMES_VERSION=${HERMES_VERSION}
+
+# Install Hermes Agent as that user - installer script AND code both come from the pinned tag
 USER hermes
 WORKDIR /home/hermes
-RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash || echo "Hermes install at build failed, will retry at start"
+RUN curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_VERSION}/scripts/install.sh \
+      | bash -s -- --branch ${HERMES_VERSION} --skip-setup \
+    || echo "Hermes install at build failed, will retry at start"
 
 USER root
 COPY start.sh /start.sh
